@@ -159,6 +159,22 @@ private static class FbTrack {
     boolean done;
 }
 
+/**
+ * Nested classes are resolved lazily, and the script host closes its class
+ * loader the instant it has constructed us -- Script.run() does loadClass,
+ * newInstance, close, and nothing in between ever touches Pearl / Shot /
+ * FbTrack, because the generics in the field initialisers below erase away.
+ * The first reflective call into the script is getDeclaredMethods(), which has
+ * to resolve the parameter types of every method we declare; by then the loader
+ * is dead and the lookup fails with NoClassDefFoundError on sc_<name>$Pearl.
+ *
+ * Naming the three types here resolves them during class init -- inside
+ * newInstance(), while the loader is still open.  Once defined they are cached
+ * by name+loader, so later resolution never consults the closed loader at all.
+ * Keep this if you add another nested type.
+ */
+private static final Object[] CLASS_PIN = new Object[]{ Pearl.class, Shot.class, FbTrack.class };
+
 
 // ------------------------------------------------------------------- state --
 
