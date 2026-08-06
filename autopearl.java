@@ -94,6 +94,7 @@ private static final int SOLVE_STEPS  = 24;   // bisection iterations per root
 private static final int DELAY_STEP   = 1;    // launch delays are scanned in
                                               // steps of this many ticks
 private static final int MAX_PLAN     = 4;    // enemy pearls considered at once
+private static final int FIRED_MEMORY = 256;  // pearl ids remembered as shot at
 
 // void metric search bounds (see voidDistance)
 private static final int VOID_DOWN = 48;
@@ -184,6 +185,15 @@ private boolean armed = false;
 private Map<Integer, Pearl> pearls = new HashMap<Integer, Pearl>();
 private List<FbTrack> tracks = new ArrayList<FbTrack>();
 private Set<String> whitelist = new HashSet<String>();
+
+/**
+ * Entity ids of pearls we have already spent a fireball on.  One pearl gets
+ * exactly one fireball, so this has to outlive the Pearl object: a pearl that
+ * leaves entity tracking range (or whose chunk unloads) is dropped from
+ * `pearls` and rebuilt with shots = 0 if it comes back, which would hand it a
+ * second shot.  Insertion-ordered so the oldest ids can be evicted.
+ */
+private Set<Integer> firedPearls = new LinkedHashSet<Integer>();
 
 // measured fireball model
 private int    launchDelay = -1;      // ticks: use packet sent -> fireball exists
@@ -293,6 +303,7 @@ private void resetState() {
     armed = false;
     pearls.clear();
     tracks.clear();
+    firedPearls.clear();
     passCache.clear();
     voidCache.clear();
     current = null;
@@ -355,6 +366,7 @@ public void onPostUpdate() {
             lastThrowAt = client.time();
             currentPearl.shots++;
             currentPearl.lastShotAt = lastThrowAt;
+            markFired(currentPearl);
             if (!currentPearl.mine) lastEnemyShotAt = lastThrowAt;
             if (sDebug) {
                 say("&bfire &7-> " + (currentPearl.mine ? "own" : nameOf(currentPearl))
@@ -1305,10 +1317,10 @@ public void onRenderTick(float partialTicks) {
 // #     shotAllowed(p, s)    hard filter on a candidate intercept             #
 // #     readyToFire(s, p)    final gate before the use packet goes out        #
 // #                                                                           #
-// #   Per pearl: p.mine, p.owner, p.age, p.shots, p.pos, p.vel, p.pathLen,    #
-// #   p.lands, p.throwElevation, p.throwTime.  Per shot: s.delay, s.flight,   #
-// #   s.distance, s.point, s.hitTick, s.origin.  Plus currentMiss and every   #
-// #   s* setting field.                                                       #
+// #   Per pearl: p.mine, p.owner, p.age, p.pos, p.vel, p.pathLen, p.lands,    #
+// #   p.throwElevation, p.throwTime, alreadyFired(p).  Per shot: s.delay,     #
+// #   s.flight, s.distance, s.point, s.hitTick, s.origin.  Plus currentMiss   #
+// #   and every s* setting field.                                             #
 // #                                                                           #
 // #############################################################################
 
@@ -1343,7 +1355,7 @@ private Shot planUserCatch(Entity me) {
         // the user's head angle at the throw, NOT the pearl's own angle
         if (p.throwElevation <= sMinAngle) continue;
         if (client.time() - p.throwTime < (long) (sUserDelay * 1000.0)) continue;
-        if (p.shots > 0 && client.time() - p.lastShotAt < 400L) continue;
+        if (alreadyFired(p)) continue;
 
         Shot[] all = shotsByDelay(p);
         for (int d = 0; d < all.length; d++) {
@@ -1458,7 +1470,7 @@ private boolean wantEnemyPearl(Pearl p, Entity me) {
         if (whitelist.contains(p.owner.toLowerCase())) return false;
         if (client.isFriend(p.owner)) return false;
     }
-    if (p.shots > 0 && client.time() - p.lastShotAt < 400L) return false;
+    if (alreadyFired(p)) return false;
     if (eyeOf(me).distanceTo(p.pos) > sMaxDist + 20.0) return false;
     return true;
 }
@@ -1492,16 +1504,37 @@ private boolean shotAllowed(Pearl p, Shot s) {
     return true;
 }
 
+/**
+ * One pearl, one fireball -- for good, not for a cooldown.  The planners drop a
+ * pearl the moment it is marked, so this is the backstop rather than the only
+ * check; it is here because this is the last thing between us and the use
+ * packet, and a second fireball at a pearl already committed to is wasted
+ * whether or not the first one connects.
+ */
+private boolean alreadyFired(Pearl p) {
+    return p.shots > 0 || firedPearls.contains(Integer.valueOf(p.id));
+}
+
+private void markFired(Pearl p) {
+    firedPearls.add(Integer.valueOf(p.id));
+    while (firedPearls.size() > FIRED_MEMORY) {
+        Iterator<Integer> it = firedPearls.iterator();
+        it.next();
+        it.remove();
+    }
+}
+
 /** Final gate before the use packet leaves. */
 private boolean readyToFire(Shot s, Pearl p) {
     if (s.delay != 0) return false;                       // solver says wait
+    if (alreadyFired(p)) return false;                    // already spent one
     if (currentMiss > sHitRadius) return false;           // would not connect
     if (!aimSettled()) return false;                      // server lacks our aim
     if (fireballCount < 1) return false;
-    // Rate limiting is deliberately left to two places only: the per-pearl
-    // re-shoot guard above, and "Enemy delay" between shots at different
-    // players' pearls.  A global floor here would silently override an Enemy
-    // delay set below it.
+    // Rate limiting is deliberately left to two places only: one-fireball-per-
+    // pearl above, and "Enemy delay" between shots at different players'
+    // pearls.  A global floor here would silently override an Enemy delay set
+    // below it.
     if (!p.mine && client.time() - lastEnemyShotAt < (long) sEnemyDelay) return false;
     return true;
 }
