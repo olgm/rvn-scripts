@@ -22,8 +22,11 @@
 //  Fireball speed is server-specific, so nothing is hardcoded: the command
 //  watches your next fireball throw and measures it.  What it records is a
 //  distance-vs-time curve, which also captures launch latency (your ping) and
-//  the spawn offset, so it works whether the server gives the fireball a flat
-//  velocity or an accelerating one.  Saved to script_config.txt; survives
+//  the spawn offset.  Fireballs accelerate rather than fly flat, so the curve
+//  is then fitted to  v <- (v + a) * decay  and the fit -- not the curve's last
+//  few samples -- is what long shots extrapolate from.  Stand still while
+//  calibrating, and give it a long clear line of sight: the further the
+//  fireball gets, the better the fit.  Saved to script_config.txt; survives
 //  restarts.  Until then the HUD says UNCALIBRATED and it uses the fallback
 //  speed slider.  Other commands:
 //
@@ -89,7 +92,18 @@ private static final double SELF_DRAG_XZ  = 0.91;
 
 private static final int PATH_TICKS   = 120;  // how far a pearl arc is simulated
 private static final int PROFILE_MAX  = 80;   // max ticks of fireball curve kept
-private static final int PROFILE_TICKS = 20;  // ticks of fireball tracked on init
+private static final int PROFILE_TICKS = 40;  // ticks of fireball tracked on init
+private static final int FIT_HEAD     = 4;    // leading samples ignored when
+                                              // fitting: the client stalls the
+                                              // entity for ~2 ticks after the
+                                              // spawn packet, then catches up
+                                              // in one double-length step
+private static final double FIT_MAX_RMS = 0.35;  // blocks; reject worse fits
+private static final double CORRECTION_TOL = 0.15;  // blocks of single-tick
+                                              // disagreement above which a
+                                              // pearl's displacement is a
+                                              // server snap, not one tick of
+                                              // flight
 private static final int SOLVE_STEPS  = 24;   // bisection iterations per root
 private static final int DELAY_STEP   = 1;    // launch delays are scanned in
                                               // steps of this many ticks
@@ -106,6 +120,7 @@ private static final String CFG_DELAY  = "autopearl.delay";
 private static final String CFG_MUZZLE = "autopearl.muzzle";
 private static final String CFG_TRAVEL = "autopearl.travel";
 private static final String CFG_TAIL   = "autopearl.tail";
+private static final String CFG_FIT    = "autopearl.fit";
 private static final String CFG_WHITE  = "autopearl.whitelist";
 
 
@@ -132,6 +147,8 @@ private static class Pearl {
     long throwTime;
     double throwElevation; // degrees, +90 = straight up, -90 = straight down
     boolean hasThrowData;
+    int coast;             // consecutive ticks whose displacement was rejected
+                           // as a server correction rather than real flight
 }
 
 /** One candidate solution: fire at +delay ticks, hit at +hitTick ticks. */
@@ -201,6 +218,13 @@ private double muzzle      = 0.0;     // blocks from eye to the fireball spawn
 private double[] travelCurve = null;  // cumulative blocks travelled per tick
 private int    travelLen   = 0;
 private double tailSpeed   = 0.0;     // blocks/tick past the end of the curve
+// Fitted form of the same measurement.  See fitTravel: the fireball keeps
+// accelerating long past the calibration window, so the curve alone is not
+// enough to extrapolate from.
+private boolean fitOk      = false;
+private double fitDecay    = 0.0;     // per-tick decay in v <- (v + a) * decay
+private double fitTerm     = 0.0;     // terminal speed, blocks/tick
+private double fitV0       = 0.0;     // speed during the fireball's first tick
 
 // /autopearl init
 private boolean initListening = false;
@@ -289,7 +313,7 @@ public void onEnable() {
     if (launchDelay < 0) {
         say("&eno fireball data &7- run &f/autopearl init &7and throw one fireball.");
     } else {
-        say("&aready&7: &f" + util.round(tailSpeed * 20.0, 1) + " blocks/s&7, launch delay &f"
+        say("&aready&7: &f" + speedLabel() + "&7, launch delay &f"
             + launchDelay + "t&7, muzzle &f" + util.round(muzzle, 2) + "&7.");
     }
 }
@@ -421,7 +445,32 @@ private void updatePearls(Entity me) {
             double dy = p.pos.y - p.lastPos.y;
             double dz = p.pos.z - p.lastPos.z;
             if (dx * dx + dy * dy + dz * dz > 1.0E-6) {
-                p.vel = new Vec3(dx * PEARL_DRAG, dy * PEARL_DRAG - PEARL_GRAVITY, dz * PEARL_DRAG);
+                // A server position update lands on a thrown entity roughly
+                // every 10 ticks (EntityTracker updateFrequency).  On those
+                // ticks the displacement is a snap, not one tick of flight,
+                // and differencing across it yields a velocity that is wildly
+                // wrong: measured median arc error 3.4 blocks at 10 ticks of
+                // lead off a correction tick against 0.03 blocks off a clean
+                // one.  Coast the previous velocity instead -- the corrected
+                // position is still used, only the poisoned derivative is
+                // thrown away.  Two in a row means our velocity is the thing
+                // that is wrong, so re-seed from what we can see.
+                boolean snap = false;
+                if (p.vel != null && p.age > 2 && p.coast < 1) {
+                    double ex = dx - p.vel.x;
+                    double ey = dy - p.vel.y;
+                    double ez = dz - p.vel.z;
+                    snap = ex * ex + ey * ey + ez * ez > CORRECTION_TOL * CORRECTION_TOL;
+                }
+                if (snap) {
+                    p.coast++;
+                    p.vel = new Vec3(p.vel.x * PEARL_DRAG,
+                                     p.vel.y * PEARL_DRAG - PEARL_GRAVITY,
+                                     p.vel.z * PEARL_DRAG);
+                } else {
+                    p.coast = 0;
+                    p.vel = new Vec3(dx * PEARL_DRAG, dy * PEARL_DRAG - PEARL_GRAVITY, dz * PEARL_DRAG);
+                }
             } else {
                 p.vel = e.getMotion();
             }
@@ -508,7 +557,15 @@ private Shot[] shotsByDelay(Pearl p) {
 
 private Shot solveForDelay(Pearl p, int delay) {
     int spawn = delay + effectiveDelay();
-    Vec3 origin = eyeAt(spawn);
+    // The fireball appears where our eye was when the use packet LEFT, not
+    // where we will have moved to by the time we see it: the server spawns it
+    // against the last position report it received.  Measured on a live server
+    // at ~6.7 ticks of launch delay -- the spawn point sat 0.03 blocks off the
+    // use-tick eye ray while sitting up to 6.3 blocks off the observation-tick
+    // ray during a fall.  Using eyeAt(spawn) here cost exactly our own
+    // displacement over effectiveDelay() ticks, which is worst while falling:
+    // the void save this feature exists for.
+    Vec3 origin = eyeAt(delay);
     if (origin == null) return null;
 
     double prev = Double.NaN;
@@ -594,6 +651,11 @@ private double separation(Pearl p, Shot s, Vec3 dir, double t) {
 /** Measured cumulative distance travelled j ticks after the fireball spawns. */
 private double travel(double j) {
     if (j <= 0.0) return 0.0;
+    if (fitOk) {
+        // Integral of v(n) = term - (term - v0) * decay^n.
+        return j * fitTerm
+             - (fitTerm - fitV0) * (1.0 - Math.pow(fitDecay, j)) / (1.0 - fitDecay);
+    }
     if (travelCurve == null || travelLen < 2) return sFallback * j;
     int i = (int) Math.floor(j);
     if (i >= travelLen - 1) return travelCurve[travelLen - 1] + tailSpeed * (j - (travelLen - 1));
@@ -601,8 +663,104 @@ private double travel(double j) {
     return travelCurve[i] * (1.0 - f) + travelCurve[i + 1] * f;
 }
 
+/**
+ * Fits the calibration curve to the fireball's actual motion,
+ * {@code v <- (v + a) * decay}, which approaches a terminal speed of
+ * {@code a * decay / (1 - decay)} instead of holding whatever speed it
+ * happened to have when the measurement window closed.
+ *
+ * <p>This matters more than anything else in the script.  Measured over 32
+ * flights on a live server: decay 0.9505, terminal 1.90 b/t (38.0 blocks/s),
+ * launch speed 1.00 b/t.  At tick 20 -- where the old three-sample linear
+ * tail was reading -- the fireball is still only doing 1.523 b/t, which is
+ * precisely the "30.46 blocks/s" that {@code /autopearl init} used to report.
+ * Extrapolating that flat left the model 12.9 blocks short by 70 ticks of
+ * flight; the fit is within 0.07 blocks over the same span.
+ *
+ * <p>Returns true and populates the fit fields only if the result actually
+ * reproduces the samples it was fitted to; otherwise the caller stays on the
+ * raw curve and its linear tail.
+ */
+private boolean fitTravel(double[] c) {
+    int n = c.length;
+    if (n < FIT_HEAD + 6) return false;
+
+    double[] step = new double[n];
+    for (int i = 1; i < n; i++) step[i] = c[i] - c[i - 1];
+
+    // Decay, from the ratio of successive step deltas.  Taken as a median so
+    // that the server position updates -- which land on the tracked entity
+    // about every 10 ticks and show up as one oversized step -- cannot drag
+    // it the way a mean would.
+    double[] rs = new double[n];
+    int rn = 0;
+    for (int k = FIT_HEAD; k < n - 1; k++) {
+        double d1 = step[k] - step[k - 1];
+        double d2 = step[k + 1] - step[k];
+        if (d1 > 1.0E-4 && d2 > 0.0) {
+            double r = d2 / d1;
+            if (r > 0.80 && r < 1.0) rs[rn++] = r;
+        }
+    }
+    if (rn < 3) return false;
+    double decay = median(rs, rn);
+
+    // Terminal speed, extrapolated off the tail: v + dv * decay / (1 - decay).
+    double[] ts = new double[n];
+    int tn = 0;
+    for (int k = Math.max(FIT_HEAD, n - 6); k < n; k++) {
+        double dv = step[k] - step[k - 1];
+        if (dv > 0.0) ts[tn++] = step[k] + dv * decay / (1.0 - decay);
+    }
+    if (tn < 1) return false;
+    double term = median(ts, tn);
+    if (term <= 0.0 || term > 8.0) return false;
+
+    // Launch speed is the only free parameter left, and the model is linear in
+    // it, so take it by least squares against the whole measured curve.
+    double num = 0.0, den = 0.0;
+    for (int j = FIT_HEAD; j < n; j++) {
+        double b = (1.0 - Math.pow(decay, j)) / (1.0 - decay);
+        num += b * (c[j] - (j * term - term * b));
+        den += b * b;
+    }
+    if (den <= 0.0) return false;
+    double v0 = num / den;
+    if (v0 < 0.0 || v0 > term * 1.5) return false;
+
+    double sse = 0.0;
+    for (int j = FIT_HEAD; j < n; j++) {
+        double e = c[j] - (j * term
+                 - (term - v0) * (1.0 - Math.pow(decay, j)) / (1.0 - decay));
+        sse += e * e;
+    }
+    if (Math.sqrt(sse / (n - FIT_HEAD)) > FIT_MAX_RMS) return false;
+
+    fitDecay = decay;
+    fitTerm = term;
+    fitV0 = v0;
+    return true;
+}
+
+private double median(double[] v, int n) {
+    double[] s = Arrays.copyOf(v, n);
+    Arrays.sort(s);
+    return (n & 1) == 1 ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) * 0.5;
+}
+
 private double muzzleOf() {
     return launchDelay < 0 ? 0.0 : muzzle;
+}
+
+/**
+ * Fireball speed for the HUD and chat.  A single number is a lie for an
+ * accelerating projectile, so show both ends of the curve when we have them.
+ */
+private String speedLabel() {
+    if (fitOk) {
+        return util.round(fitV0 * 20.0, 1) + "-" + util.round(fitTerm * 20.0, 1) + " b/s";
+    }
+    return util.round(tailSpeed * 20.0, 1) + " b/s";
 }
 
 /** Ticks between the use packet leaving and the fireball existing. */
@@ -617,10 +775,17 @@ private int pingTicks() {
         Entity me = client.getPlayer();
         if (me != null) {
             NetworkPlayer np = me.getNetworkPlayer();
-            if (np != null && np.getPing() > 0) return (int) Math.round(np.getPing() / 50.0);
+            // Plenty of servers never populate the tab-list ping and report 0
+            // or 1 ms forever.  One measured at a steady 1 ms while the real
+            // launch delay was 6.7 ticks, so believing it would have cost six
+            // ticks of lead on every uncalibrated shot.  Anything under a LAN
+            // round trip is a placeholder, not a measurement.
+            if (np != null && np.getPing() >= 20) {
+                return (int) Math.round(np.getPing() / 50.0);
+            }
         }
     } catch (Throwable ignored) {}
-    return 2;
+    return 5;
 }
 
 
@@ -715,15 +880,24 @@ private void finishTrack(FbTrack t) {
     tailSpeed = curve.length >= 4
         ? (curve[curve.length - 1] - curve[curve.length - 4]) / 3.0
         : curve[curve.length - 1] / (curve.length - 1);
+    fitOk = fitTravel(curve);
 
     saveCalibration();
     initListening = false;   // disable the init entity listener
 
-    client.print(util.color("&a[Success] &7logged velocity of entity &f" + t.type + " &7at &f"
-        + util.round(tailSpeed * 20.0, 2) + " blocks/s"));
+    client.print(util.color("&a[Success] &7logged velocity of entity &f" + t.type
+        + (fitOk
+            ? " &7at &f" + util.round(fitV0 * 20.0, 1) + " &7-> &f"
+              + util.round(fitTerm * 20.0, 1) + " blocks/s"
+            : " &7at &f" + util.round(tailSpeed * 20.0, 2) + " blocks/s &e(no fit)")));
     if (sDebug) {
         say("&8launch delay " + launchDelay + "t, muzzle " + util.round(muzzle, 2)
-            + ", curve " + travelLen + "t");
+            + ", curve " + travelLen + "t"
+            + (fitOk ? ", decay " + util.round(fitDecay, 4) : ", flat tail"));
+    }
+    if (!fitOk) {
+        say("&ecould not fit an acceleration curve &7- throw again with a longer "
+            + "clear line of sight. Long shots will lead too far until you do.");
     }
 }
 
@@ -737,6 +911,9 @@ private void saveCalibration() {
     config.set(CFG_MUZZLE, String.valueOf(util.round(muzzle, 4)));
     config.set(CFG_TAIL, String.valueOf(util.round(tailSpeed, 4)));
     config.set(CFG_TRAVEL, sb.toString());
+    config.set(CFG_FIT, fitOk
+        ? util.round(fitDecay, 6) + "," + util.round(fitTerm, 6) + "," + util.round(fitV0, 6)
+        : "");
 }
 
 private void loadCalibration() {
@@ -754,10 +931,27 @@ private void loadCalibration() {
         tailSpeed = tl == null ? 0.0 : Double.parseDouble(tl.trim());
         travelCurve = curve;
         travelLen = curve.length;
+
+        // Calibrations saved before the acceleration fit existed have no fit
+        // string; refit them from the curve we already stored rather than
+        // silently leaving them on the flat tail.
+        String ft = config.get(CFG_FIT);
+        fitOk = false;
+        if (ft != null && ft.length() > 0) {
+            String[] fp = ft.split(",");
+            if (fp.length == 3) {
+                fitDecay = Double.parseDouble(fp[0].trim());
+                fitTerm = Double.parseDouble(fp[1].trim());
+                fitV0 = Double.parseDouble(fp[2].trim());
+                fitOk = fitDecay > 0.0 && fitDecay < 1.0 && fitTerm > 0.0;
+            }
+        }
+        if (!fitOk) fitOk = fitTravel(curve);
     } catch (Throwable t) {
         launchDelay = -1;
         travelCurve = null;
         travelLen = 0;
+        fitOk = false;
     }
 }
 
@@ -794,8 +988,9 @@ private boolean handleCommand(String raw) {
         if (launchDelay < 0) {
             say("&euncalibrated &7- using fallback &f" + util.round(sFallback * 20.0, 1) + " blocks/s");
         } else {
-            say("&f" + util.round(tailSpeed * 20.0, 2) + " blocks/s&7, launch delay &f" + launchDelay
-                + "t&7, muzzle &f" + util.round(muzzle, 2) + "&7, curve &f" + travelLen + "t");
+            say("&f" + speedLabel() + "&7, launch delay &f" + launchDelay
+                + "t&7, muzzle &f" + util.round(muzzle, 2) + "&7, curve &f" + travelLen + "t"
+                + (fitOk ? "&7, decay &f" + util.round(fitDecay, 4) : " &e(flat tail)"));
         }
         say("&7whitelist: &f" + (whitelist.isEmpty() ? "empty" : joinNames()));
         say("&7fireballs in hotbar: &f" + countFireballs());
@@ -931,7 +1126,17 @@ public void onWorldJoin(Entity entity) {
         Vec3 spawn = entity.getPosition();
         Vec3 eye = eyeOf(me);
         double dSelf = eye.distanceTo(spawn);
-        if (dSelf > 8.0 || !isClosestPlayer(spawn, dSelf)) return;
+        if (!isClosestPlayer(spawn, dSelf)) return;
+        // The muzzle is measured against where we are NOW, but the fireball
+        // spawned where we were when the packet left, so any movement during
+        // the launch delay is picked up as muzzle offset.  Measured properly
+        // the offset is ~0.03 blocks; the old 8-block bound happily accepted
+        // the 6.3 blocks of a falling player and baked it in permanently.
+        if (dSelf > 2.0) {
+            say("&cmoved during calibration &7- spawn was &f" + util.round(dSelf, 2)
+                + "&7 blocks from your eye. Stand still and throw again.");
+            return;
+        }
 
         FbTrack t = new FbTrack();
         t.id = entity.entityId;
@@ -1283,7 +1488,7 @@ public void onRenderTick(float partialTicks) {
 
     String cal = launchDelay < 0
         ? "UNCALIBRATED - run /autopearl init"
-        : util.round(tailSpeed * 20.0, 1) + " b/s, delay " + launchDelay + "t";
+        : speedLabel() + ", delay " + launchDelay + "t";
     render.text2d("autopearl: " + cal + (initListening ? "  [waiting for your fireball]" : ""),
                   x, y, 1.0f, launchDelay < 0 || initListening ? warn : white, true);
     y += 10.0f;
