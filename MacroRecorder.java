@@ -51,6 +51,20 @@
  *     scripts" is on. Comments are scanned too.
  *   - Rotations are written to both the entity and the outgoing PlayerState so
  *     the replayed aim matches what was recorded on the same tick.
+ *   - Movement, jump and crouch are recorded from movementInput rather than
+ *     from the keybinds, so what gets stored is the input the game actually
+ *     used that tick.
+ *   - Keys are injected from onPreUpdate, which fires at the head of
+ *     EntityPlayerSP.onUpdate, immediately before onLivingUpdate calls
+ *     updatePlayerMoveState. Pressing them from onPreMotion instead lands
+ *     after the movement for that tick was already applied, so the press only
+ *     takes hold a tick later with a full runTick in between.
+ *
+ * Macros saved before the keybind names were corrected hold false for every
+ * movement key, because the old build polled names the loader never had in its
+ * map. Rotations and sprint still replay from those files, which looks like
+ * "it turns and sprints but never walks". Such macros cannot be repaired, they
+ * have to be recorded again; playback warns when it loads one.
  */
 
 // Sandbox provides ArrayList, HashMap, List and Map already.
@@ -75,6 +89,11 @@ int currentRepeat = 0;
 boolean isRecording = false;
 boolean isPlaying = false;
 boolean waitingForFirstInput = false;
+// Playback starts from inside onPreMotion, by which point this tick's
+// onPreUpdate has already run. Skip that one tick so frame 0 gets its keys and
+// its rotation on the same tick instead of a frame apart.
+boolean playbackJustStarted = false;
+boolean warnedInjectionFailed = false;
 
 int targetPlayerId = -1;
 String targetPlayerName = "";
@@ -112,6 +131,7 @@ void onLoad() {
     modules.registerButton("Behaviour", "Record On First Input", false);
     modules.registerButton("Behaviour", "Record Other Player", false);
     modules.registerButton("Behaviour", "Show Indicator", true);
+    modules.registerButton("Behaviour", "Debug", false);
 
     modules.registerGroup("Record Channels");
     modules.registerButton("Record Channels", "Rec Camera", true);
@@ -160,6 +180,102 @@ void onDisable() {
 }
 
 // ---------------------------------------------------------------------------
+// Key injection. This runs at the head of EntityPlayerSP.onUpdate, so the
+// presses set here are read by updatePlayerMoveState later in the same tick
+// and move the player on that tick. onPreMotion is too late: by then
+// onLivingUpdate has already turned this tick's input into motion.
+// ---------------------------------------------------------------------------
+void onPreUpdate() {
+    if (!isPlaying || playbackJustStarted) return;
+    if (playbackIndex < 0 || playbackIndex >= playbackFrames.size()) return;
+    applyFrameKeys(playbackFrames.get(playbackIndex));
+}
+
+void applyFrameKeys(Map<String, Object> frame) {
+    boolean pbMovement = modules.getButton(scriptName, "Play Movement");
+    boolean pbSprint = modules.getButton(scriptName, "Play Sprint");
+    boolean pbJump = modules.getButton(scriptName, "Play Jump");
+    boolean pbCrouch = modules.getButton(scriptName, "Play Crouch");
+    boolean pbAttack = modules.getButton(scriptName, "Play Attack");
+    boolean pbUse = modules.getButton(scriptName, "Play Use");
+    boolean pbDrop = modules.getButton(scriptName, "Play Drop");
+    boolean pbSlot = modules.getButton(scriptName, "Play Slot");
+
+    if (pbMovement) {
+        boolean wantFwd = isDown(frame, "fwd");
+        keybinds.setPressed("forward", wantFwd);
+        keybinds.setPressed("left", isDown(frame, "left"));
+        keybinds.setPressed("back", isDown(frame, "back"));
+        keybinds.setPressed("right", isDown(frame, "right"));
+
+        // A press that does not read back never reached the keybind the game
+        // polls, and no amount of retrying here will change that.
+        if (wantFwd && !keybinds.isPressed("forward") && !warnedInjectionFailed) {
+            warnedInjectionFailed = true;
+            say("&cKey injection is not taking hold: pressed 'forward' and it read back as up.");
+        }
+    } else {
+        keybinds.setPressed("forward", false);
+        keybinds.setPressed("left", false);
+        keybinds.setPressed("back", false);
+        keybinds.setPressed("right", false);
+    }
+
+    if (pbJump) {
+        Object jumpO = frame.get("jump");
+        if (jumpO != null) {
+            boolean j = (boolean) jumpO;
+            keybinds.setPressed("jump", j);
+            client.setJump(j);
+        }
+    }
+
+    if (pbSprint) {
+        Object sprintO = frame.get("sprint");
+        if (sprintO != null) client.setSprinting((boolean) sprintO);
+    }
+
+    if (pbCrouch) {
+        Object sneakO = frame.get("sneak");
+        if (sneakO != null) {
+            boolean s = (boolean) sneakO;
+            keybinds.setPressed("sneak", s);
+            client.setSneak(s);
+        }
+    }
+
+    if (pbAttack) {
+        Object attackO = frame.get("attack");
+        if (attackO != null) {
+            boolean att = (boolean) attackO;
+            keybinds.setPressed("attack", att);
+            if (att) keybinds.leftClick();
+        }
+    }
+
+    if (pbUse) {
+        Object useO = frame.get("use");
+        if (useO != null) {
+            boolean u = (boolean) useO;
+            keybinds.setPressed("use", u);
+            if (u) keybinds.rightClick();
+        }
+    }
+
+    if (pbDrop && isDown(frame, "drop")) {
+        client.dropItem(false);
+    }
+
+    if (pbSlot) {
+        double slotD = getDouble(frame, "slot");
+        if (slotD != NOT_SET) {
+            int s = (int) slotD;
+            if (s >= 0 && s <= 8) inventory.setSlot(s);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main tick - key detection, frame recording and playback
 // ---------------------------------------------------------------------------
 void onPreMotion(PlayerState state) {
@@ -182,15 +298,10 @@ void onPreMotion(PlayerState state) {
     boolean recDrop = modules.getButton(scriptName, "Rec Drop");
     boolean recSlot = modules.getButton(scriptName, "Rec Slot");
 
+    // Only the camera is applied here; every key channel is applied from
+    // onPreUpdate, early enough in the tick for the game to act on it.
     boolean pbCamera = modules.getButton(scriptName, "Play Camera");
-    boolean pbMovement = modules.getButton(scriptName, "Play Movement");
-    boolean pbSprint = modules.getButton(scriptName, "Play Sprint");
-    boolean pbJump = modules.getButton(scriptName, "Play Jump");
-    boolean pbCrouch = modules.getButton(scriptName, "Play Crouch");
-    boolean pbAttack = modules.getButton(scriptName, "Play Attack");
-    boolean pbUse = modules.getButton(scriptName, "Play Use");
-    boolean pbDrop = modules.getButton(scriptName, "Play Drop");
-    boolean pbSlot = modules.getButton(scriptName, "Play Slot");
+    boolean debug = modules.getButton(scriptName, "Debug");
 
     // -- keybind polling (rising edge) --------------------------------------
     boolean startRecordDown = modules.getKeyPressed(scriptName, "Start Record");
@@ -326,13 +437,23 @@ void onPreMotion(PlayerState state) {
                     yaw = state.yaw;
                     pitch = state.pitch;
                 }
-                fwd = recMovement ? (Object) keybinds.isPressed("forward") : null;
-                left = recMovement ? (Object) keybinds.isPressed("left") : null;
-                back = recMovement ? (Object) keybinds.isPressed("back") : null;
-                right = recMovement ? (Object) keybinds.isPressed("right") : null;
-                jump = recJump ? (Object) keybinds.isPressed("jump") : null;
+                // Movement comes from movementInput, which is what the game
+                // actually walked on this tick. updatePlayerMoveState builds it
+                // as: forward ++moveForward, back --moveForward, left
+                // ++moveStrafe, right --moveStrafe, then scales by 0.3 while
+                // sneaking and 0.2 while using an item, so compare against a
+                // small epsilon rather than 1.
+                if (recMovement) {
+                    float mf = client.getForward();
+                    float ms = client.getStrafe();
+                    fwd = mf > 0.01f;
+                    back = mf < -0.01f;
+                    left = ms > 0.01f;
+                    right = ms < -0.01f;
+                }
+                jump = recJump ? (Object) client.isJump() : null;
                 sprint = recSprint ? (Object) player.isSprinting() : null;
-                sneak = recCrouch ? (Object) player.isSneaking() : null;
+                sneak = recCrouch ? (Object) client.isSneak() : null;
                 attack = recAttack ? (Object) keybinds.isPressed("attack") : null;
                 use = recUse ? (Object) keybinds.isPressed("use") : null;
                 drop = recDrop ? (Object) keybinds.isPressed("drop") : null;
@@ -364,6 +485,13 @@ void onPreMotion(PlayerState state) {
             return;
         }
 
+        // Playback was started earlier in this same call, after this tick's
+        // onPreUpdate had already gone by. Give frame 0 a full tick.
+        if (playbackJustStarted) {
+            playbackJustStarted = false;
+            return;
+        }
+
         if (playbackIndex >= playbackFrames.size()) {
             if (loop) {
                 playbackIndex = 0;
@@ -392,70 +520,12 @@ void onPreMotion(PlayerState state) {
             }
         }
 
-        // movement keys
-        if (pbMovement) {
-            keybinds.setPressed("forward", isDown(frame, "fwd"));
-            keybinds.setPressed("left", isDown(frame, "left"));
-            keybinds.setPressed("back", isDown(frame, "back"));
-            keybinds.setPressed("right", isDown(frame, "right"));
-        } else {
-            keybinds.setPressed("forward", false);
-            keybinds.setPressed("left", false);
-            keybinds.setPressed("back", false);
-            keybinds.setPressed("right", false);
-        }
-
-        if (pbJump) {
-            Object jumpO = frame.get("jump");
-            if (jumpO != null) {
-                boolean j = (boolean) jumpO;
-                client.setJump(j);
-                keybinds.setPressed("jump", j);
-            }
-        }
-
-        if (pbSprint) {
-            Object sprintO = frame.get("sprint");
-            if (sprintO != null) client.setSprinting((boolean) sprintO);
-        }
-
-        if (pbCrouch) {
-            Object sneakO = frame.get("sneak");
-            if (sneakO != null) {
-                boolean s = (boolean) sneakO;
-                client.setSneak(s);
-                keybinds.setPressed("sneak", s);
-            }
-        }
-
-        if (pbAttack) {
-            Object attackO = frame.get("attack");
-            if (attackO != null) {
-                boolean att = (boolean) attackO;
-                keybinds.setPressed("attack", att);
-                if (att) keybinds.leftClick();
-            }
-        }
-
-        if (pbUse) {
-            Object useO = frame.get("use");
-            if (useO != null) {
-                boolean u = (boolean) useO;
-                keybinds.setPressed("use", u);
-                if (u) keybinds.rightClick();
-            }
-        }
-
-        if (pbDrop && isDown(frame, "drop")) {
-            client.dropItem(false);
-        }
-
-        if (pbSlot) {
-            double slotD = getDouble(frame, "slot");
-            if (slotD != NOT_SET) {
-                int s = (int) slotD;
-                if (s >= 0 && s <= 8) inventory.setSlot(s);
-            }
+        // Every key channel was already applied by onPreUpdate for this tick.
+        if (debug) {
+            say("&8[" + playbackIndex + "] want fwd=" + isDown(frame, "fwd")
+                    + " movementInput=" + util.round(client.getForward(), 2)
+                    + "/" + util.round(client.getStrafe(), 2)
+                    + " keyDown=" + keybinds.isPressed("forward"));
         }
 
         // advance once the repeat count for this frame is used up
@@ -567,10 +637,9 @@ void playLastRecording(boolean loop) {
         return;
     }
     playbackFrames = new ArrayList<>(recordedFrames);
-    playbackIndex = 0;
-    currentRepeat = 0;
-    isPlaying = true;
+    startPlayback();
     say("&aPlaying last recording (" + playbackFrames.size() + " frames)." + (loop ? " &7[Looping]" : ""));
+    warnIfNoKeyInput(false);
 }
 
 void playSelectedMacro(boolean loop) {
@@ -595,18 +664,43 @@ void loadMacroIntoPlayback(String name, boolean loop) {
         return;
     }
     playbackFrames = frames;
+    startPlayback();
+    say("&aPlaying macro '&f" + name + "&a' (" + playbackFrames.size() + " frames)." + (loop ? " &7[Looping]" : ""));
+    warnIfNoKeyInput(true);
+}
+
+void startPlayback() {
     playbackIndex = 0;
     currentRepeat = 0;
     isPlaying = true;
-    say("&aPlaying macro '&f" + name + "&a' (" + playbackFrames.size() + " frames)." + (loop ? " &7[Looping]" : ""));
+    playbackJustStarted = true;
+    warnedInjectionFailed = false;
 }
 
 void stopPlayback(boolean announce) {
     isPlaying = false;
     playbackIndex = 0;
     currentRepeat = 0;
+    playbackJustStarted = false;
     releaseAllKeys();
     if (announce) say("&ePlayback stopped.");
+}
+
+// Frames recorded by the build that polled the wrong keybind names hold false
+// for every key, so they turn and sprint but never walk. Nothing can recover
+// the lost input, so say so plainly instead of replaying a dud.
+void warnIfNoKeyInput(boolean fromFile) {
+    String[] keys = {"fwd", "left", "back", "right", "jump", "attack", "use", "drop"};
+    for (int i = 0; i < playbackFrames.size(); i++) {
+        Map<String, Object> frame = playbackFrames.get(i);
+        for (int k = 0; k < keys.length; k++) {
+            if (isDown(frame, keys[k])) return;
+        }
+    }
+    say("&cThis recording holds no key input at all, so it will only turn and sprint.");
+    if (fromFile) {
+        say("&7Macros saved before the keybind fix are all like this. Record it again.");
+    }
 }
 
 // ---------------------------------------------------------------------------
