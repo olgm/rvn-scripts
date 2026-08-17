@@ -61,10 +61,10 @@
  *   - Movement, jump and crouch are recorded from movementInput rather than
  *     from the keybinds, so what gets stored is the input the game actually
  *     used that tick.
- *   - Horizontal motion is recorded alongside the keys. If key injection does
- *     not reach the game on a given setup, "Force Motion" replays that motion
- *     directly instead. It is off by default because the key path reproduces
- *     the original physics and this one only reproduces the path.
+ *   - World displacement is recorded alongside the keys. If key injection does
+ *     not reach the game on a given setup, "Force Motion" replays that
+ *     displacement before vanilla collision handling instead. It is off by
+ *     default because the key path reproduces the original physics.
  *
  * Macros saved before the keybind names were corrected hold false for every
  * movement key. Rotations and sprint still replay from those files, which looks
@@ -77,7 +77,7 @@
 // ---------------------------------------------------------------------------
 // Per-tick frame data, stored as Map<String,Object> so it can be serialised to
 // JSON and read back with the built-in Json class.
-// Numbers: yaw, pitch, mx, mz, slot, repeats   (NOT_SET when not recorded)
+// Numbers: yaw, pitch, dx, dz, slot, repeats   (NOT_SET when not recorded)
 // Flags:   fwd, left, back, right, jump, sprint, sneak, attack, use, drop
 //          (null when not recorded, which is distinct from a recorded false)
 // ---------------------------------------------------------------------------
@@ -238,14 +238,46 @@ String bindName(String base) {
 void onPreUpdate() {
     preUpdateCalls++;
     if (!isPlaying || playbackJustStarted) return;
-    if (playbackIndex < 0 || playbackIndex >= playbackFrames.size()) return;
-    applyFrameKeys(playbackFrames.get(playbackIndex));
+    if (playbackIndex < 0) return;
+    if (playbackIndex >= playbackFrames.size()) {
+        if (modules.getButton(scriptName, "Loop")) {
+            playbackIndex = 0;
+            currentRepeat = 0;
+        } else {
+            releaseAllKeys();
+            return;
+        }
+    }
+
+    Map<String, Object> frame = playbackFrames.get(playbackIndex);
+    // Heading must be in place before onLivingUpdate calculates acceleration.
+    applyFrameCamera(frame);
+    applyFrameKeys(frame);
+}
+
+void applyFrameCamera(Map<String, Object> frame) {
+    if (!modules.getButton(scriptName, "Play Camera")) return;
+
+    Entity player = client.getPlayer();
+    if (player == null) return;
+
+    double yawD = getDouble(frame, "yaw");
+    double pitchD = getDouble(frame, "pitch");
+    if (yawD != NOT_SET) player.setYaw((float) yawD);
+    if (pitchD != NOT_SET) player.setPitch((float) pitchD);
 }
 
 void applyFrameKeys(Map<String, Object> frame) {
     if (!bindsResolved) resolveBindNames();
 
-    if (modules.getButton(scriptName, "Play Movement")) {
+    boolean playMovement = modules.getButton(scriptName, "Play Movement");
+    boolean forceMotion = modules.getButton(scriptName, "Force Motion");
+    boolean useDisplacement = playMovement && forceMotion && hasDisplacement(frame);
+
+    // Force Motion is exclusive with movement keys. Keeping both enabled adds
+    // vanilla acceleration to an already recorded path and can exceed legal
+    // horizontal speed at the start of playback.
+    if (playMovement && !useDisplacement) {
         keybinds.setPressed(kForward, isDown(frame, "fwd"));
         keybinds.setPressed(kLeft, isDown(frame, "left"));
         keybinds.setPressed(kBack, isDown(frame, "back"));
@@ -255,6 +287,15 @@ void applyFrameKeys(Map<String, Object> frame) {
         keybinds.setPressed(kLeft, false);
         keybinds.setPressed(kBack, false);
         keybinds.setPressed(kRight, false);
+    }
+
+    if (useDisplacement) {
+        double dx = getDouble(frame, "dx");
+        double dz = getDouble(frame, "dz");
+        Vec3 current = client.getMotion();
+        // This is set at PreUpdate, before moveEntityWithHeading runs. Vanilla
+        // still performs collision checks and applies its normal post-move drag.
+        client.setMotion(dx, current.y, dz);
     }
 
     if (modules.getButton(scriptName, "Play Jump")) {
@@ -326,7 +367,6 @@ void onPreMotion(PlayerState state) {
     boolean loop = modules.getButton(scriptName, "Loop");
     boolean recordOnFirstInput = modules.getButton(scriptName, "Record On First Input");
     boolean debug = modules.getButton(scriptName, "Debug");
-    boolean forceMotion = modules.getButton(scriptName, "Force Motion");
 
     boolean recCamera = modules.getButton(scriptName, "Rec Camera");
     boolean recMovement = modules.getButton(scriptName, "Rec Movement");
@@ -339,7 +379,6 @@ void onPreMotion(PlayerState state) {
     boolean recSlot = modules.getButton(scriptName, "Rec Slot");
 
     boolean pbCamera = modules.getButton(scriptName, "Play Camera");
-    boolean pbMovement = modules.getButton(scriptName, "Play Movement");
 
     // -- keybind polling (rising edge) --------------------------------------
     boolean startRecordDown = modules.getKeyPressed(scriptName, "Start Record");
@@ -411,8 +450,8 @@ void onPreMotion(PlayerState state) {
             double yaw = NOT_SET;
             double pitch = NOT_SET;
             double slot = NOT_SET;
-            double mx = NOT_SET;
-            double mz = NOT_SET;
+            double dx = NOT_SET;
+            double dz = NOT_SET;
             Object fwd = null;
             Object left = null;
             Object back = null;
@@ -439,17 +478,17 @@ void onPreMotion(PlayerState state) {
                 }
 
                 if (recMovement) {
-                    double dx = target.getX() - target.getPrevX();
-                    double dz = target.getZ() - target.getPrevZ();
-                    mx = util.round(dx, 4);
-                    mz = util.round(dz, 4);
+                    double observedDx = target.getX() - target.getPrevX();
+                    double observedDz = target.getZ() - target.getPrevZ();
+                    dx = util.round(observedDx, 4);
+                    dz = util.round(observedDz, 4);
                     fwd = false;
                     back = false;
                     left = false;
                     right = false;
 
-                    if (dx * dx + dz * dz > 0.0001) {
-                        double moveAngle = Math.toDegrees(Math.atan2(-dx, dz));
+                    if (observedDx * observedDx + observedDz * observedDz > 0.0001) {
+                        double moveAngle = Math.toDegrees(Math.atan2(-observedDx, observedDz));
                         double diff = moveAngle - target.getYaw();
                         while (diff < -180) diff += 360;
                         while (diff > 180) diff -= 360;
@@ -492,11 +531,10 @@ void onPreMotion(PlayerState state) {
                     left = ms > 0.01f;
                     right = ms < -0.01f;
 
-                    // Kept alongside the keys so a recording can still be
-                    // replayed by Force Motion if the presses go nowhere.
-                    Vec3 motion = client.getMotion();
-                    mx = util.round(motion.x, 4);
-                    mz = util.round(motion.z, 4);
+                    // Store what the server-facing position actually moved,
+                    // rather than the post-friction velocity for the next tick.
+                    dx = util.round(player.getX() - player.getPrevX(), 4);
+                    dz = util.round(player.getZ() - player.getPrevZ(), 4);
                 }
                 jump = recJump ? (Object) client.isJump() : null;
                 sprint = recSprint ? (Object) player.isSprinting() : null;
@@ -508,7 +546,7 @@ void onPreMotion(PlayerState state) {
             }
 
             Map<String, Object> frame = buildFrame(yaw, pitch, fwd, left, back, right,
-                    jump, sprint, sneak, attack, use, drop, slot, mx, mz, 1);
+                    jump, sprint, sneak, attack, use, drop, slot, dx, dz, 1);
 
             // Run-length encoding: bump the repeat count on an identical frame.
             if (!recordedFrames.isEmpty()) {
@@ -553,8 +591,8 @@ void onPreMotion(PlayerState state) {
         Map<String, Object> frame = playbackFrames.get(playbackIndex);
         playbackTicks++;
 
-        // camera: the entity rotation survives the tick, the PlayerState is
-        // what actually leaves in this tick's position packet.
+        // Camera was installed in onPreUpdate before movement. Write the same
+        // values into the outgoing state so the packet and physics agree.
         if (pbCamera) {
             double yawD = getDouble(frame, "yaw");
             double pitchD = getDouble(frame, "pitch");
@@ -573,17 +611,6 @@ void onPreMotion(PlayerState state) {
         // still works, one tick later than recorded.
         if (preUpdateCalls == 0) {
             applyFrameKeys(frame);
-        }
-
-        // Replay the recorded velocity outright. Only for setups where the
-        // presses never reach the game; the key path keeps real physics.
-        if (forceMotion && pbMovement) {
-            double fmx = getDouble(frame, "mx");
-            double fmz = getDouble(frame, "mz");
-            if (fmx != NOT_SET && fmz != NOT_SET) {
-                Vec3 current = client.getMotion();
-                client.setMotion(fmx, current.y, fmz);
-            }
         }
 
         if (debug) debugTick(frame);
@@ -950,7 +977,7 @@ Map<String, Object> buildFrame(double yaw, double pitch,
                                Object fwd, Object left, Object back, Object right,
                                Object jump, Object sprint, Object sneak,
                                Object attack, Object use, Object drop,
-                               double slot, double mx, double mz, int repeats) {
+                               double slot, double dx, double dz, int repeats) {
     Map<String, Object> m = new HashMap<>();
     m.put("yaw", yaw);
     m.put("pitch", pitch);
@@ -965,8 +992,8 @@ Map<String, Object> buildFrame(double yaw, double pitch,
     m.put("use", use);
     m.put("drop", drop);
     m.put("slot", slot);
-    m.put("mx", mx);
-    m.put("mz", mz);
+    m.put("dx", dx);
+    m.put("dz", dz);
     m.put("repeats", (double) repeats);
     return m;
 }
@@ -980,7 +1007,7 @@ boolean framesEqual(Map<String, Object> a, Map<String, Object> b) {
         if (av == null || bv == null) return false;
         if (!av.equals(bv)) return false;
     }
-    String[] numKeys = {"yaw", "pitch", "slot", "mx", "mz"};
+    String[] numKeys = {"yaw", "pitch", "slot", "dx", "dz"};
     for (int i = 0; i < numKeys.length; i++) {
         if (getDouble(a, numKeys[i]) != getDouble(b, numKeys[i])) return false;
     }
@@ -990,6 +1017,14 @@ boolean framesEqual(Map<String, Object> a, Map<String, Object> b) {
 boolean isDown(Map<String, Object> frame, String key) {
     Object v = frame.get(key);
     return v != null && (boolean) v;
+}
+
+boolean hasDisplacement(Map<String, Object> frame) {
+    double dx = getDouble(frame, "dx");
+    double dz = getDouble(frame, "dz");
+    return dx != NOT_SET && dz != NOT_SET
+            && !Double.isNaN(dx) && !Double.isNaN(dz)
+            && !Double.isInfinite(dx) && !Double.isInfinite(dz);
 }
 
 double getDouble(Map<String, Object> m, String key) {
@@ -1002,7 +1037,7 @@ double getDouble(Map<String, Object> m, String key) {
 // JSON serialisation and parsing
 // ---------------------------------------------------------------------------
 String framesToJson(List<Map<String, Object>> frames) {
-    String[] numKeys = {"yaw", "pitch", "slot", "mx", "mz", "repeats"};
+    String[] numKeys = {"yaw", "pitch", "slot", "dx", "dz", "repeats"};
     String[] boolKeys = {"fwd", "left", "back", "right", "jump", "sprint", "sneak", "attack", "use", "drop"};
     StringBuilder sb = new StringBuilder();
     sb.append("[");
@@ -1048,7 +1083,7 @@ List<Map<String, Object>> parseFramesFromJson(String jsonStr) {
         List<Json> items = parsed.array();
         if (items == null) return null;
 
-        String[] numKeys = {"yaw", "pitch", "slot", "mx", "mz", "repeats"};
+        String[] numKeys = {"yaw", "pitch", "slot", "dx", "dz", "repeats"};
         String[] boolKeys = {"fwd", "left", "back", "right", "jump", "sprint", "sneak", "attack", "use", "drop"};
 
         List<Map<String, Object>> result = new ArrayList<>();
